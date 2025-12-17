@@ -3,27 +3,29 @@ import { floatTo16BitPCM, arrayBufferToBase64, base64ToArrayBuffer, playAudioDat
 import './App.css';
 
 const GEMINI_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
-const SAMPLE_RATE = 24000; // Match Gemini's audio output sample rate
+const SAMPLE_RATE = 24000;
+
+// --- Components ---
 
 function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState('Ready to start');
   const [error, setError] = useState('');
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
+  const [latency, setLatency] = useState(null);
+  const [userTranscript, setUserTranscript] = useState('');
   
   const wsRef = useRef(null);
   const audioContextRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const processorRef = useRef(null);
   const sourceRef = useRef(null);
-  const keepAliveIntervalRef = useRef(null);
   const nextStartTimeRef = useRef(0);
-  
-  // Voice activity detection
+  const isSpacePressedRef = useRef(false);
+  const requestStartTimeRef = useRef(null);
   const audioBufferRef = useRef([]);
-  const isSpeakingRef = useRef(false);
-  const silenceTimerRef = useRef(null);
-  const SILENCE_THRESHOLD = 0.01; // Audio level threshold
-  const SILENCE_DURATION = 1000; // 1 second of silence before sending
+  const isRecordingRef = useRef(false);
+  const recognitionRef = useRef(null);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -32,25 +34,134 @@ function App() {
     };
   }, []);
 
+  // Handle spacebar press
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.code === 'Space' && !e.repeat && !isSpacePressedRef.current && isRecording) {
+        e.preventDefault();
+        isSpacePressedRef.current = true;
+        setIsSpacePressed(true);
+        setStatus('Listening...');
+        
+        // Start speech recognition
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+            setUserTranscript(''); // Clear previous transcript
+          } catch (e) {
+            // Ignore if already started
+          }
+        }
+      }
+    };
+
+    const handleKeyUp = (e) => {
+      if (e.code === 'Space' && isSpacePressedRef.current && isRecording) {
+        e.preventDefault();
+        isSpacePressedRef.current = false;
+        setIsSpacePressed(false);
+        
+        // Stop speech recognition
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.stop();
+          } catch (e) {
+            // Ignore
+          }
+        }
+        
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && audioBufferRef.current.length > 0) {
+          setStatus('Processing...');
+          
+          const totalLength = audioBufferRef.current.reduce((sum, arr) => sum + arr.length, 0);
+          const combinedAudio = new Float32Array(totalLength);
+          let offset = 0;
+          for (const chunk of audioBufferRef.current) {
+            combinedAudio.set(chunk, offset);
+            offset += chunk.length;
+          }
+          
+          const pcm16 = floatTo16BitPCM(combinedAudio);
+          const base64Audio = arrayBufferToBase64(pcm16);
+          
+          requestStartTimeRef.current = performance.now();
+          wsRef.current.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{
+                mimeType: 'audio/pcm',
+                data: base64Audio
+              }]
+            }
+          }));
+          
+          audioBufferRef.current = [];
+          setStatus('Waiting for response...');
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [isRecording]);
+
   const startRecording = async () => {
+    if (isRecordingRef.current) return;
+
+    // Set state immediately to prevent race conditions and double-clicks
+    setIsRecording(true);
+    isRecordingRef.current = true;
+
     try {
       setError('');
       setStatus('Requesting microphone access...');
+      setLatency(null);
+      setUserTranscript('');
 
-      // Check for API key
       const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-      if (!apiKey) {
-        throw new Error('VITE_GEMINI_API_KEY not found. Please add it to your .env file');
+      if (!apiKey) throw new Error('VITE_GEMINI_API_KEY not found');
+
+      // Initialize Speech Recognition
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'en-US';
+        
+        recognition.onresult = (event) => {
+          let interimTranscript = '';
+          let finalTranscript = '';
+
+          for (let i = event.resultIndex; i < event.results.length; ++i) {
+            if (event.results[i].isFinal) {
+              finalTranscript += event.results[i][0].transcript;
+            } else {
+              interimTranscript += event.results[i][0].transcript;
+            }
+          }
+          
+          if (interimTranscript || finalTranscript) {
+             setUserTranscript(finalTranscript + interimTranscript);
+          }
+        };
+        
+        recognitionRef.current = recognition;
       }
 
-      // Initialize audio context
+      // Create AudioContext
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE
       });
       
       nextStartTimeRef.current = 0;
+      audioBufferRef.current = [];
 
-      // Get microphone access
+      // Get Media Stream
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
@@ -59,22 +170,35 @@ function App() {
           noiseSuppression: true
         } 
       });
+
+      // Check if user cancelled while waiting for permission
+      if (!isRecordingRef.current) {
+        stream.getTracks().forEach(track => track.stop());
+        if (audioContextRef.current) audioContextRef.current.close();
+        return;
+      }
+
       mediaStreamRef.current = stream;
+      setStatus('Connecting...');
 
-      setStatus('Connecting to Gemini...');
-
-      // Connect to Gemini Live API via WebSocket
       const ws = new WebSocket(
         `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`
       );
       
       wsRef.current = ws;
 
-      ws.onopen = () => {
-        setStatus('Connected! Start speaking...');
-        setIsRecording(true);
+      ws.onopen = async () => {
+        if (!isRecordingRef.current) {
+           ws.close();
+           return;
+        }
+        
+        setStatus('Connected! Hold Space to speak');
+        
+        if (audioContextRef.current?.state === 'suspended') {
+          await audioContextRef.current.resume();
+        }
 
-        // Send initial setup message with proper audio configuration
         ws.send(JSON.stringify({
           setup: {
             model: `models/${GEMINI_MODEL}`,
@@ -91,161 +215,65 @@ function App() {
           }
         }));
 
-        // Set up audio processing
-        const source = audioContextRef.current.createMediaStreamSource(stream);
-        sourceRef.current = source;
+        try {
+          const source = audioContextRef.current.createMediaStreamSource(stream);
+          sourceRef.current = source;
 
-        // Create ScriptProcessor for audio capture
-        const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
+          const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+          processorRef.current = processor;
 
-        processor.onaudioprocess = (e) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            const inputData = e.inputBuffer.getChannelData(0);
-            
-            // Calculate audio level for voice activity detection
-            const audioLevel = Math.sqrt(
-              inputData.reduce((sum, sample) => sum + sample * sample, 0) / inputData.length
-            );
-            
-            const isSpeaking = audioLevel > SILENCE_THRESHOLD;
-            
-            if (isSpeaking) {
-              // User is speaking - buffer the audio
-              if (!isSpeakingRef.current) {
-                console.log('🎙️ Started speaking');
-                setStatus('Listening...');
-                isSpeakingRef.current = true;
-              }
-              
-              // Clear any existing silence timer
-              if (silenceTimerRef.current) {
-                clearTimeout(silenceTimerRef.current);
-                silenceTimerRef.current = null;
-              }
-              
-              // Buffer the audio
+          processor.onaudioprocess = (e) => {
+            if (ws.readyState === WebSocket.OPEN && isSpacePressedRef.current) {
+              const inputData = e.inputBuffer.getChannelData(0);
               audioBufferRef.current.push(new Float32Array(inputData));
-              
-            } else if (isSpeakingRef.current) {
-              // User was speaking but is now silent
-              if (!silenceTimerRef.current) {
-                // Start silence timer
-                silenceTimerRef.current = setTimeout(() => {
-                  console.log('🤫 Silence detected - sending audio');
-                  setStatus('Processing...');
-                  
-                  // Concatenate all buffered audio
-                  const totalLength = audioBufferRef.current.reduce((sum, arr) => sum + arr.length, 0);
-                  const combinedAudio = new Float32Array(totalLength);
-                  let offset = 0;
-                  
-                  for (const chunk of audioBufferRef.current) {
-                    combinedAudio.set(chunk, offset);
-                    offset += chunk.length;
-                  }
-                  
-                  // Convert to PCM16 and send
-                  const pcm16 = floatTo16BitPCM(combinedAudio);
-                  const base64Audio = arrayBufferToBase64(pcm16);
-                  
-                  ws.send(JSON.stringify({
-                    realtimeInput: {
-                      mediaChunks: [{
-                        mimeType: 'audio/pcm',
-                        data: base64Audio
-                      }]
-                    }
-                  }));
-                  
-                  // Clear the buffer and reset state
-                  audioBufferRef.current = [];
-                  isSpeakingRef.current = false;
-                  silenceTimerRef.current = null;
-                  setStatus('Waiting for response...');
-                }, SILENCE_DURATION);
-              }
             }
-          }
-        };
+          };
 
-        source.connect(processor);
-        processor.connect(audioContextRef.current.destination);
+          source.connect(processor);
+          processor.connect(audioContextRef.current.destination);
+        } catch (e) {
+          console.error("Audio graph setup failed", e);
+          stopRecording();
+        }
       };
 
       ws.onmessage = async (event) => {
         try {
-          // Handle both text and Blob data
+          if (!isRecordingRef.current) return;
+
           let data = event.data;
-          
-          // If data is a Blob, convert to text first
-          if (data instanceof Blob) {
-            data = await data.text();
-          }
+          if (data instanceof Blob) data = await data.text();
           
           const response = JSON.parse(data);
-          console.log('Received response:', response);
           
-          // Handle setup confirmation
-          if (response.setupComplete) {
-            console.log('Setup complete');
-            return;
-          }
+          if (response.setupComplete) return;
 
-          // Handle audio response
           if (response.serverContent?.modelTurn?.parts) {
+            if (requestStartTimeRef.current) {
+              const latencyMs = performance.now() - requestStartTimeRef.current;
+              setLatency(Math.round(latencyMs));
+              requestStartTimeRef.current = null;
+            }
+
             const parts = response.serverContent.modelTurn.parts;
-            console.log('📦 Parts received:', JSON.stringify(parts, null, 2));
-            
             for (const part of parts) {
-              // Check for ANY inline data (audio in any format)
               if (part.inlineData?.data) {
-                const mimeType = part.inlineData.mimeType || 'unknown';
-                console.log('🔊 Received audio data!');
-                console.log('   - Mime type:', mimeType);
-                console.log('   - Data length:', part.inlineData.data.length);
-                
-                try {
-                  // Decode base64 to binary
-                  const audioData = base64ToArrayBuffer(part.inlineData.data);
-                  console.log('   - Decoded buffer size:', audioData.byteLength, 'bytes');
-                  
-                  // Play the audio
-                  const { source: audioSource, duration, playTime } = await playAudioData(
-                    audioContextRef.current, 
-                    audioData, 
-                    nextStartTimeRef.current
-                  );
-                  
-                  nextStartTimeRef.current = playTime + duration;
-                  
-                  setStatus('🔊 Speaking...');
-                  console.log('✅ Audio playback scheduled!');
-                  
-                  // Don't stop recording here, as it closes the WebSocket
-                  // and we might receive multiple chunks or want to continue the conversation
-                  /*
-                  audioSource.onended = () => {
-                    console.log('✅ Audio playback finished - stopping recording');
-                    stopRecording();
-                  };
-                  */
-                } catch (audioErr) {
-                  console.error('❌ Error playing audio:', audioErr);
-                  setError('Failed to play audio response');
-                }
-              }
-              
-              // Log text responses (shouldn't happen if audio is configured)
-              if (part.text) {
-                console.log('⚠️ Received TEXT instead of audio:', part.text);
+                if (!audioContextRef.current) return;
+
+                const audioData = base64ToArrayBuffer(part.inlineData.data);
+                const { duration, playTime } = await playAudioData(
+                  audioContextRef.current, 
+                  audioData, 
+                  nextStartTimeRef.current
+                );
+                nextStartTimeRef.current = playTime + duration;
+                setStatus('Speaking...');
               }
             }
           }
 
-          // Handle turn complete
           if (response.serverContent?.turnComplete) {
-            setStatus('Response complete. Speak again...');
+            setStatus('Reply finished. Your turn.');
           }
 
         } catch (err) {
@@ -255,110 +283,104 @@ function App() {
 
       ws.onerror = (err) => {
         console.error('WebSocket error:', err);
-        setError('Connection error occurred');
+        setError('Connection error');
         stopRecording();
       };
 
       ws.onclose = () => {
-        console.log('WebSocket closed');
-        if (isRecording) {
-          setStatus('Disconnected');
+        if (isRecordingRef.current) {
+           setStatus('Disconnected');
+           stopRecording();
         }
       };
 
     } catch (err) {
       console.error('Error starting recording:', err);
-      setError(err.message || 'Failed to start recording');
-      setStatus('Error occurred');
+      setError(err.message || 'Failed to start');
       stopRecording();
     }
   };
 
   const stopRecording = () => {
     setIsRecording(false);
+    isRecordingRef.current = false;
     setStatus('Stopped');
-
-    // Clear voice activity detection timers
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
+    setIsSpacePressed(false);
+    isSpacePressedRef.current = false;
     audioBufferRef.current = [];
-    isSpeakingRef.current = false;
 
-    // Close WebSocket
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        // Ignore
+      }
+      recognitionRef.current = null;
+    }
+
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
     }
-
-    // Stop audio processing
     if (processorRef.current) {
       processorRef.current.disconnect();
+      processorRef.current.onaudioprocess = null;
       processorRef.current = null;
     }
-
     if (sourceRef.current) {
       sourceRef.current.disconnect();
       sourceRef.current = null;
     }
-
-    // Stop media stream
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
-
-    // Close audio context
     if (audioContextRef.current) {
-      audioContextRef.current.close();
+      try {
+        audioContextRef.current.close();
+      } catch (e) {
+        console.error("Error closing audio context", e);
+      }
       audioContextRef.current = null;
     }
   };
 
   return (
-    <div className="app">
-      <div className="container">
+    <div className="app-container">
+      <div className="main-card">
         <div className="header">
-          <h1>🎤 Voice Assistant</h1>
-          <p className="subtitle">Powered by Gemini AI</p>
-        </div>
-
-        <div className={`microphone-visual ${isRecording ? 'active' : ''}`}>
-          <div className="mic-icon">
-            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-              <line x1="12" y1="19" x2="12" y2="23"></line>
-              <line x1="8" y1="23" x2="16" y2="23"></line>
-            </svg>
+          <h1>Gemini Live</h1>
+          <div className={`connection-badge ${isRecording ? 'connected' : ''}`}>
+            {isRecording ? 'Connected' : 'Offline'}
           </div>
-          {isRecording && <div className="pulse-ring"></div>}
         </div>
 
-        <div className="status-section">
-          <p className={`status-text ${error ? 'error' : ''}`}>
-            {error || status}
-          </p>
+        <div className={`visualizer-container ${isSpacePressed ? 'active' : ''}`}>
+          <div className="pulse-ring"></div>
+          <div className="mic-icon">
+            {isRecording ? '🎙️' : '🔇'}
+          </div>
         </div>
+
+        <div className="status-area">
+          <p className="status-text">{error || status}</p>
+          {latency && <span className="latency-tag">⚡ {latency}ms</span>}
+        </div>
+
+        {userTranscript && (
+          <div className="transcript-box">
+            <p className="transcript-text">"{userTranscript}"</p>
+          </div>
+        )}
 
         <div className="controls">
           <button 
-            className={`btn ${isRecording ? 'btn-stop' : 'btn-start'}`}
+            className={`primary-btn ${isRecording ? 'active' : ''}`}
             onClick={isRecording ? stopRecording : startRecording}
           >
-            {isRecording ? (
-              <>
-                <span className="btn-icon">⏹</span>
-                Stop
-              </>
-            ) : (
-              <>
-                <span className="btn-icon">🎙️</span>
-                Start Talking
-              </>
-            )}
+            {isRecording ? 'End Session' : 'Start Conversation'}
           </button>
+          <p className="hint-text">Hold <kbd>Space</kbd> to speak</p>
         </div>
       </div>
     </div>
