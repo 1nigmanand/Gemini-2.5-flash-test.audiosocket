@@ -9,11 +9,13 @@ const SAMPLE_RATE = 24000;
 
 function App() {
   const [isRecording, setIsRecording] = useState(false);
-  const [status, setStatus] = useState('Ready to start');
+  const [status, setStatus] = useState('System Offline');
   const [error, setError] = useState('');
   const [isSpacePressed, setIsSpacePressed] = useState(false);
-  const [latency, setLatency] = useState(null);
+  const [latency, setLatency] = useState(0);
   const [userTranscript, setUserTranscript] = useState('');
+  const [logs, setLogs] = useState([]);
+  const [sessionTime, setSessionTime] = useState(0);
   
   const wsRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -26,6 +28,12 @@ function App() {
   const audioBufferRef = useRef([]);
   const isRecordingRef = useRef(false);
   const recognitionRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const addLog = (message) => {
+    const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    setLogs(prev => [`[${time}] ${message}`, ...prev].slice(0, 50));
+  };
 
   // Cleanup on unmount
   useEffect(() => {
@@ -33,6 +41,19 @@ function App() {
       stopRecording();
     };
   }, []);
+
+  // Session Timer
+  useEffect(() => {
+    if (isRecording) {
+      timerRef.current = setInterval(() => {
+        setSessionTime(prev => prev + 1);
+      }, 1000);
+    } else {
+      clearInterval(timerRef.current);
+      setSessionTime(0);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [isRecording]);
 
   // Handle spacebar press
   useEffect(() => {
@@ -42,12 +63,13 @@ function App() {
         isSpacePressedRef.current = true;
         setIsSpacePressed(true);
         setStatus('Listening...');
+        addLog('Microphone active - Listening');
         
         // Start speech recognition
         if (recognitionRef.current) {
           try {
             recognitionRef.current.start();
-            setUserTranscript(''); // Clear previous transcript
+            setUserTranscript(''); 
           } catch (e) {
             // Ignore if already started
           }
@@ -72,6 +94,7 @@ function App() {
         
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && audioBufferRef.current.length > 0) {
           setStatus('Processing...');
+          addLog('Processing audio buffer...');
           
           const totalLength = audioBufferRef.current.reduce((sum, arr) => sum + arr.length, 0);
           const combinedAudio = new Float32Array(totalLength);
@@ -112,14 +135,14 @@ function App() {
   const startRecording = async () => {
     if (isRecordingRef.current) return;
 
-    // Set state immediately to prevent race conditions and double-clicks
     setIsRecording(true);
     isRecordingRef.current = true;
+    addLog('Initializing system...');
 
     try {
       setError('');
-      setStatus('Requesting microphone access...');
-      setLatency(null);
+      setStatus('Requesting Access');
+      setLatency(0);
       setUserTranscript('');
 
       const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
@@ -153,7 +176,6 @@ function App() {
         recognitionRef.current = recognition;
       }
 
-      // Create AudioContext
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE
       });
@@ -161,7 +183,6 @@ function App() {
       nextStartTimeRef.current = 0;
       audioBufferRef.current = [];
 
-      // Get Media Stream
       const stream = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           channelCount: 1,
@@ -171,7 +192,6 @@ function App() {
         } 
       });
 
-      // Check if user cancelled while waiting for permission
       if (!isRecordingRef.current) {
         stream.getTracks().forEach(track => track.stop());
         if (audioContextRef.current) audioContextRef.current.close();
@@ -180,6 +200,7 @@ function App() {
 
       mediaStreamRef.current = stream;
       setStatus('Connecting...');
+      addLog('Connecting to Gemini WebSocket...');
 
       const ws = new WebSocket(
         `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${apiKey}`
@@ -193,7 +214,8 @@ function App() {
            return;
         }
         
-        setStatus('Connected! Hold Space to speak');
+        setStatus('System Online');
+        addLog('Connection established');
         
         if (audioContextRef.current?.state === 'suspended') {
           await audioContextRef.current.resume();
@@ -233,6 +255,7 @@ function App() {
           processor.connect(audioContextRef.current.destination);
         } catch (e) {
           console.error("Audio graph setup failed", e);
+          addLog(`Error: ${e.message}`);
           stopRecording();
         }
       };
@@ -246,7 +269,10 @@ function App() {
           
           const response = JSON.parse(data);
           
-          if (response.setupComplete) return;
+          if (response.setupComplete) {
+            addLog('Setup complete. Ready.');
+            return;
+          }
 
           if (response.serverContent?.modelTurn?.parts) {
             if (requestStartTimeRef.current) {
@@ -267,13 +293,15 @@ function App() {
                   nextStartTimeRef.current
                 );
                 nextStartTimeRef.current = playTime + duration;
-                setStatus('Speaking...');
+                setStatus('Receiving Audio');
+                addLog('Receiving audio stream...');
               }
             }
           }
 
           if (response.serverContent?.turnComplete) {
-            setStatus('Reply finished. Your turn.');
+            setStatus('Turn Complete');
+            addLog('Turn complete. Waiting for input.');
           }
 
         } catch (err) {
@@ -284,12 +312,14 @@ function App() {
       ws.onerror = (err) => {
         console.error('WebSocket error:', err);
         setError('Connection error');
+        addLog('WebSocket Error occurred');
         stopRecording();
       };
 
       ws.onclose = () => {
         if (isRecordingRef.current) {
            setStatus('Disconnected');
+           addLog('Connection closed');
            stopRecording();
         }
       };
@@ -297,6 +327,7 @@ function App() {
     } catch (err) {
       console.error('Error starting recording:', err);
       setError(err.message || 'Failed to start');
+      addLog(`Error: ${err.message}`);
       stopRecording();
     }
   };
@@ -304,10 +335,11 @@ function App() {
   const stopRecording = () => {
     setIsRecording(false);
     isRecordingRef.current = false;
-    setStatus('Stopped');
+    setStatus('System Offline');
     setIsSpacePressed(false);
     isSpacePressedRef.current = false;
     audioBufferRef.current = [];
+    addLog('System shutdown initiated');
 
     if (recognitionRef.current) {
       try {
@@ -345,42 +377,103 @@ function App() {
     }
   };
 
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
   return (
-    <div className="app-container">
-      <div className="main-card">
-        <div className="header">
-          <h1>Gemini Live</h1>
-          <div className={`connection-badge ${isRecording ? 'connected' : ''}`}>
-            {isRecording ? 'Connected' : 'Offline'}
+    <div className="console-container">
+      <div className="console-header">
+        <div className="header-title">
+          <span className="status-dot-header"></span>
+          <h1>GEMINI LIVE CONSOLE</h1>
+        </div>
+        <div className="header-meta">
+          <span>V 2.5.0</span>
+          <span>SECURE LINK</span>
+        </div>
+      </div>
+
+      <div className="console-grid">
+        {/* Left Column: Status & Metrics */}
+        <div className="panel status-panel">
+          <div className="panel-header">SYSTEM STATUS</div>
+          <div className="panel-content">
+            <div className="metric-row">
+              <span className="label">STATE</span>
+              <span className={`value ${isRecording ? 'active' : 'inactive'}`}>
+                {isRecording ? 'ONLINE' : 'OFFLINE'}
+              </span>
+            </div>
+            <div className="metric-row">
+              <span className="label">MODE</span>
+              <span className="value">VOICE/AUDIO</span>
+            </div>
+            <div className="metric-row">
+              <span className="label">LATENCY</span>
+              <span className="value">{latency}ms</span>
+            </div>
+            <div className="metric-row">
+              <span className="label">SESSION</span>
+              <span className="value">{formatTime(sessionTime)}</span>
+            </div>
+            <div className="metric-row">
+              <span className="label">BUFFER</span>
+              <span className="value">{audioBufferRef.current.length} chunks</span>
+            </div>
           </div>
         </div>
 
-        <div className={`visualizer-container ${isSpacePressed ? 'active' : ''}`}>
-          <div className="pulse-ring"></div>
-          <div className="mic-icon">
-            {isRecording ? '🎙️' : '🔇'}
+        {/* Center Column: Visualizer & Transcript */}
+        <div className="panel main-panel">
+          <div className="visualizer-section">
+            <div className={`visualizer-ring ${isSpacePressed ? 'active' : ''}`}></div>
+            <div className={`visualizer-ring delay-1 ${isSpacePressed ? 'active' : ''}`}></div>
+            <div className="mic-center">
+              {isRecording ? (
+                <span className="mic-icon">🎙️</span>
+              ) : (
+                <span className="mic-icon">⛔</span>
+              )}
+            </div>
+            <div className="status-overlay">{status.toUpperCase()}</div>
+          </div>
+          
+          <div className="transcript-section">
+            <div className="panel-header">LIVE TRANSCRIPT</div>
+            <div className="transcript-content">
+              {userTranscript || <span className="placeholder">Waiting for input...</span>}
+            </div>
           </div>
         </div>
 
-        <div className="status-area">
-          <p className="status-text">{error || status}</p>
-          {latency && <span className="latency-tag">⚡ {latency}ms</span>}
-        </div>
-
-        {userTranscript && (
-          <div className="transcript-box">
-            <p className="transcript-text">"{userTranscript}"</p>
+        {/* Right Column: Controls & Logs */}
+        <div className="panel right-panel">
+          <div className="controls-section">
+            <div className="panel-header">CONTROLS</div>
+            <button 
+              className={`console-btn ${isRecording ? 'stop' : 'start'}`}
+              onClick={isRecording ? stopRecording : startRecording}
+            >
+              {isRecording ? 'TERMINATE SESSION' : 'INITIALIZE SYSTEM'}
+            </button>
+            <div className="instruction-box">
+              <span className="key">SPACE</span>
+              <span className="desc">HOLD TO TALK</span>
+            </div>
           </div>
-        )}
 
-        <div className="controls">
-          <button 
-            className={`primary-btn ${isRecording ? 'active' : ''}`}
-            onClick={isRecording ? stopRecording : startRecording}
-          >
-            {isRecording ? 'End Session' : 'Start Conversation'}
-          </button>
-          <p className="hint-text">Hold <kbd>Space</kbd> to speak</p>
+          <div className="logs-section">
+            <div className="panel-header">SYSTEM LOGS</div>
+            <div className="logs-content">
+              {logs.map((log, i) => (
+                <div key={i} className="log-entry">{log}</div>
+              ))}
+              {logs.length === 0 && <div className="log-entry">System ready...</div>}
+            </div>
+          </div>
         </div>
       </div>
     </div>
