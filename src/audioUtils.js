@@ -19,7 +19,7 @@ export function floatTo16BitPCM(float32Array) {
  * Resample audio from source sample rate to target sample rate
  * Browser typically captures at 48kHz, but Gemini expects 16kHz
  */
-export function resampleAudio(audioBuffer, targetSampleRate = 16000) {
+export function resampleAudio(audioBuffer, targetSampleRate = 24000) {
   const offlineContext = new OfflineAudioContext(
     1, // mono
     audioBuffer.duration * targetSampleRate,
@@ -62,7 +62,7 @@ export function base64ToArrayBuffer(base64) {
 /**
  * Play PCM16 audio data through Web Audio API
  */
-export async function playAudioData(audioContext, pcm16Data) {
+export async function playAudioData(audioContext, pcm16Data, startTime = 0) {
   // Convert PCM16 to Float32 for Web Audio API
   const view = new DataView(pcm16Data);
   const float32Array = new Float32Array(view.byteLength / 2);
@@ -73,13 +73,18 @@ export async function playAudioData(audioContext, pcm16Data) {
   }
   
   // Create audio buffer and play
-  const audioBuffer = audioContext.createBuffer(1, float32Array.length, 16000);
+  // Gemini returns audio at 24kHz, so we need to match that sample rate
+  const audioBuffer = audioContext.createBuffer(1, float32Array.length, 24000);
   audioBuffer.getChannelData(0).set(float32Array);
   
   const source = audioContext.createBufferSource();
   source.buffer = audioBuffer;
   source.connect(audioContext.destination);
-  source.start(0);
   
-  return source;
+  // Schedule playback
+  // If startTime is 0 or in the past, play immediately (or as soon as possible)
+  const playTime = Math.max(audioContext.currentTime, startTime);
+  source.start(playTime);
+  
+  return { source, duration: audioBuffer.duration, playTime };
 }

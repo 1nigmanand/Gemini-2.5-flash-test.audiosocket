@@ -3,7 +3,7 @@ import { floatTo16BitPCM, arrayBufferToBase64, base64ToArrayBuffer, playAudioDat
 import './App.css';
 
 const GEMINI_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
-const SAMPLE_RATE = 16000;
+const SAMPLE_RATE = 24000; // Match Gemini's audio output sample rate
 
 function App() {
   const [isRecording, setIsRecording] = useState(false);
@@ -16,6 +16,14 @@ function App() {
   const processorRef = useRef(null);
   const sourceRef = useRef(null);
   const keepAliveIntervalRef = useRef(null);
+  const nextStartTimeRef = useRef(0);
+  
+  // Voice activity detection
+  const audioBufferRef = useRef([]);
+  const isSpeakingRef = useRef(false);
+  const silenceTimerRef = useRef(null);
+  const SILENCE_THRESHOLD = 0.01; // Audio level threshold
+  const SILENCE_DURATION = 1000; // 1 second of silence before sending
 
   // Cleanup on unmount
   useEffect(() => {
@@ -39,6 +47,8 @@ function App() {
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE
       });
+      
+      nextStartTimeRef.current = 0;
 
       // Get microphone access
       const stream = await navigator.mediaDevices.getUserMedia({ 
@@ -92,18 +102,70 @@ function App() {
         processor.onaudioprocess = (e) => {
           if (ws.readyState === WebSocket.OPEN) {
             const inputData = e.inputBuffer.getChannelData(0);
-            const pcm16 = floatTo16BitPCM(inputData);
-            const base64Audio = arrayBufferToBase64(pcm16);
-
-            // Send audio chunk to Gemini
-            ws.send(JSON.stringify({
-              realtimeInput: {
-                mediaChunks: [{
-                  mimeType: 'audio/pcm',
-                  data: base64Audio
-                }]
+            
+            // Calculate audio level for voice activity detection
+            const audioLevel = Math.sqrt(
+              inputData.reduce((sum, sample) => sum + sample * sample, 0) / inputData.length
+            );
+            
+            const isSpeaking = audioLevel > SILENCE_THRESHOLD;
+            
+            if (isSpeaking) {
+              // User is speaking - buffer the audio
+              if (!isSpeakingRef.current) {
+                console.log('🎙️ Started speaking');
+                setStatus('Listening...');
+                isSpeakingRef.current = true;
               }
-            }));
+              
+              // Clear any existing silence timer
+              if (silenceTimerRef.current) {
+                clearTimeout(silenceTimerRef.current);
+                silenceTimerRef.current = null;
+              }
+              
+              // Buffer the audio
+              audioBufferRef.current.push(new Float32Array(inputData));
+              
+            } else if (isSpeakingRef.current) {
+              // User was speaking but is now silent
+              if (!silenceTimerRef.current) {
+                // Start silence timer
+                silenceTimerRef.current = setTimeout(() => {
+                  console.log('🤫 Silence detected - sending audio');
+                  setStatus('Processing...');
+                  
+                  // Concatenate all buffered audio
+                  const totalLength = audioBufferRef.current.reduce((sum, arr) => sum + arr.length, 0);
+                  const combinedAudio = new Float32Array(totalLength);
+                  let offset = 0;
+                  
+                  for (const chunk of audioBufferRef.current) {
+                    combinedAudio.set(chunk, offset);
+                    offset += chunk.length;
+                  }
+                  
+                  // Convert to PCM16 and send
+                  const pcm16 = floatTo16BitPCM(combinedAudio);
+                  const base64Audio = arrayBufferToBase64(pcm16);
+                  
+                  ws.send(JSON.stringify({
+                    realtimeInput: {
+                      mediaChunks: [{
+                        mimeType: 'audio/pcm',
+                        data: base64Audio
+                      }]
+                    }
+                  }));
+                  
+                  // Clear the buffer and reset state
+                  audioBufferRef.current = [];
+                  isSpeakingRef.current = false;
+                  silenceTimerRef.current = null;
+                  setStatus('Waiting for response...');
+                }, SILENCE_DURATION);
+              }
+            }
           }
         };
 
@@ -149,9 +211,25 @@ function App() {
                   console.log('   - Decoded buffer size:', audioData.byteLength, 'bytes');
                   
                   // Play the audio
-                  await playAudioData(audioContextRef.current, audioData);
+                  const { source: audioSource, duration, playTime } = await playAudioData(
+                    audioContextRef.current, 
+                    audioData, 
+                    nextStartTimeRef.current
+                  );
+                  
+                  nextStartTimeRef.current = playTime + duration;
+                  
                   setStatus('🔊 Speaking...');
-                  console.log('✅ Audio playback started!');
+                  console.log('✅ Audio playback scheduled!');
+                  
+                  // Don't stop recording here, as it closes the WebSocket
+                  // and we might receive multiple chunks or want to continue the conversation
+                  /*
+                  audioSource.onended = () => {
+                    console.log('✅ Audio playback finished - stopping recording');
+                    stopRecording();
+                  };
+                  */
                 } catch (audioErr) {
                   console.error('❌ Error playing audio:', audioErr);
                   setError('Failed to play audio response');
@@ -199,6 +277,14 @@ function App() {
   const stopRecording = () => {
     setIsRecording(false);
     setStatus('Stopped');
+
+    // Clear voice activity detection timers
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    audioBufferRef.current = [];
+    isSpeakingRef.current = false;
 
     // Close WebSocket
     if (wsRef.current) {
